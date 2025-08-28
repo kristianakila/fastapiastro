@@ -2,13 +2,27 @@ import os
 import secrets
 import requests
 import hashlib
+import json
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# Инициализация Firestore из переменной окружения FIREBASE_KEY_JSON
+firebase_key_json = os.getenv("FIREBASE_KEY_JSON")
+if not firebase_key_json:
+    raise RuntimeError("FIREBASE_KEY_JSON is not set in environment variables")
+
+cred = credentials.Certificate(json.loads(firebase_key_json))
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
 app = FastAPI()
 
-# Настройка CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://astf.vercel.app"],  # домен фронтенда
@@ -18,14 +32,14 @@ app.add_middleware(
 )
 
 TERMINAL_KEY = os.getenv("TERMINAL_KEY", "1691507148627DEMO")
-SECRET_KEY = os.getenv("SECRET_KEY", "bm5fjkoz0s5vw87j")  # для теста
+SECRET_KEY = os.getenv("SECRET_KEY", "bm5fjkoz0s5vw87j")  # тестовый
 
 class PaymentRequest(BaseModel):
     orderId: str
     amount: int
     description: str
     email: str
-    customerKey: str  # уникальный id пользователя
+    customerKey: str
 
 class ChargeRequest(BaseModel):
     amount: int
@@ -37,7 +51,7 @@ def generate_token(data: dict) -> str:
     token_string = ''.join(str(v) for _, v in sorted(data_with_password.items()))
     return hashlib.sha256(token_string.encode("utf-8")).hexdigest()
 
-# 1️⃣ Первый платёж — инициализация подписки
+# 1️⃣ Первый платёж
 @app.post("/init-payment")
 def init_payment(payload: PaymentRequest):
     data = {
@@ -50,10 +64,29 @@ def init_payment(payload: PaymentRequest):
         "Recurrent": "Y"
     }
     data["Token"] = generate_token(data)
+
     try:
         r = requests.post("https://securepay.tinkoff.ru/v2/Init", json=data, timeout=10)
         r.raise_for_status()
-        return r.json()  # в ответе придёт PaymentURL
+        resp_data = r.json()
+
+        # Сохраняем в Firestore
+        db.collection("telegramUsers").document(payload.customerKey).set({
+            "email": payload.email,
+            "orderId": payload.orderId,
+            "amount": payload.amount,
+            "description": payload.description,
+            "subscription": {
+                "status": "pending",
+                "createdAt": firestore.SERVER_TIMESTAMP
+            },
+            "tinkoff": {
+                "PaymentId": resp_data.get("PaymentId"),
+                "PaymentURL": resp_data.get("PaymentURL")
+            }
+        }, merge=True)
+
+        return resp_data
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
@@ -70,29 +103,44 @@ def charge_payment(payload: ChargeRequest):
     try:
         r = requests.post("https://securepay.tinkoff.ru/v2/Charge", json=data, timeout=10)
         r.raise_for_status()
-        return r.json()
+        resp_data = r.json()
+
+        # Логируем списание
+        db.collection("telegramUsers").document(payload.customerKey).update({
+            "lastCharge": firestore.SERVER_TIMESTAMP,
+            "lastChargeResult": resp_data
+        })
+
+        return resp_data
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-# 3️⃣ Обработка уведомлений от Tinkoff
+# 3️⃣ Callback от Tinkoff
 @app.post("/tinkoff-callback")
 async def tinkoff_callback(payload: dict):
     received_token = payload.get("Token")
     if not received_token:
         return {"Success": False, "error": "No token"}
+
     payload_copy = payload.copy()
     payload_copy.pop("Token", None)
     expected_token = generate_token(payload_copy)
+
     if not secrets.compare_digest(received_token, expected_token):
         return {"Success": False, "error": "Invalid token"}
 
     status = payload.get("Status")
-    order_id = payload.get("OrderId")
+    customer_key = payload.get("CustomerKey")
     rebill_id = payload.get("RebillId")
 
-    # 📌 Здесь — логика сохранения статуса в БД
-    # if status == "CONFIRMED" and rebill_id:
-    #     save_rebill_id(customer_key, rebill_id)
+    # Обновляем Firestore
+    if customer_key:
+        update_data = {
+            "subscription.status": status.lower(),
+            "subscription.updatedAt": firestore.SERVER_TIMESTAMP
+        }
+        if rebill_id:
+            update_data["tinkoff.RebillId"] = rebill_id
+        db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
-
