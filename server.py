@@ -39,7 +39,7 @@ class PaymentRequest(BaseModel):
     amount: int
     description: str
     email: str
-    customerKey: str
+    customerKey: str  # ⚠️ Должен быть telegram_id пользователя
 
 class ChargeRequest(BaseModel):
     amount: int
@@ -50,6 +50,30 @@ def generate_token(data: dict) -> str:
     data_with_password = {**data, "Password": SECRET_KEY}
     token_string = ''.join(str(v) for _, v in sorted(data_with_password.items()))
     return hashlib.sha256(token_string.encode("utf-8")).hexdigest()
+
+# 0️⃣ ОПОВЕЩЕНИЯ
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
+
+def send_telegram_message(chat_id: str, text: str):
+    """Отправка сообщения в Telegram пользователю или админу"""
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN не задан")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        print(f"📩 Сообщение отправлено {chat_id}")
+    except Exception as e:
+        print("Ошибка отправки в Telegram:", e)
+
 
 # 1️⃣ Первый платёж
 @app.post("/init-payment")
@@ -85,9 +109,25 @@ def init_payment(payload: PaymentRequest):
             }
         }, merge=True)
 
+        # Отправляем сообщение пользователю
+        send_telegram_message(
+            chat_id=payload.customerKey,  # ⚠️ должен быть telegram_id
+            text=f"✅ Ваш заказ <b>{payload.description}</b> на сумму {payload.amount/100:.2f}₽ создан!"
+        )
+
+        # Оповещение админу
+        if TELEGRAM_ADMIN_ID:
+            send_telegram_message(
+                chat_id=TELEGRAM_ADMIN_ID,
+                text=f"🛒 Новый заказ!\nПользователь: {payload.customerKey}\n"
+                     f"Описание: {payload.description}\n"
+                     f"Сумма: {payload.amount/100:.2f}₽"
+            )
+
         return resp_data
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
+
 
 # 2️⃣ Ежемесячное автосписание
 @app.post("/charge")
@@ -113,6 +153,7 @@ def charge_payment(payload: ChargeRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
+
 # 3️⃣ Callback от Tinkoff: POST для уведомлений, GET для BackURL
 from fastapi.responses import RedirectResponse
 
@@ -134,6 +175,19 @@ async def tinkoff_callback_get(request: Request):
                 "subscription.lastCallbackPayload": params
             })
             print(f"✅ Статус подписки обновлён для {doc.id}")
+
+            # Сообщение пользователю
+            send_telegram_message(
+                chat_id=doc.id,
+                text="🎉 Оплата прошла успешно! Ваша подписка активирована."
+            )
+
+            # Сообщение админу
+            if TELEGRAM_ADMIN_ID:
+                send_telegram_message(
+                    chat_id=TELEGRAM_ADMIN_ID,
+                    text=f"💳 Оплата подтверждена!\nПользователь: {doc.id}\nOrderId: {order_id}"
+                )
 
     # При желании можно сделать redirect на фронтенд
     # return RedirectResponse(url=f"https://astf.vercel.app/success?{request.query_params}")
@@ -194,5 +248,3 @@ async def tinkoff_callback_post(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
-
-
