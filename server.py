@@ -113,19 +113,34 @@ def charge_payment(payload: ChargeRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-# 3️⃣ Callback от Tinkoff с логированием и GET для тестов
-@app.post("/tinkoff-callback")
+# 3️⃣ Callback от Tinkoff: POST для уведомлений, GET для BackURL
+from fastapi.responses import RedirectResponse
+
+# GET — это переход пользователя по BackURL, обрабатываем отдельно
 @app.get("/tinkoff-callback")
-async def tinkoff_callback(request: Request):
+async def tinkoff_callback_get(request: Request):
+    params = dict(request.query_params)
+    print("🌐 BackURL GET params:", params)
+
+    # Здесь можно сделать redirect на страницу фронтенда с этими параметрами
+    # return RedirectResponse(url=f"https://astf.vercel.app/success?{request.query_params}")
+
+    return {
+        "info": "BackURL redirect от Tinkoff",
+        "params": params
+    }
+
+# POST — это серверный callback с JSON и токеном
+@app.post("/tinkoff-callback")
+async def tinkoff_callback_post(request: Request):
     try:
         payload = await request.json()
     except Exception:
         payload = {}
+    print("🔥 Callback POST получен:", payload)
 
-    print(f"🔥 Callback {request.method} получен:", payload)
-
-    if request.method != "POST" or not payload:
-        return {"Success": False, "info": "Callback endpoint, ожидается POST с JSON"}
+    if not payload:
+        return {"Success": False, "error": "Empty payload"}
 
     received_token = payload.get("Token")
     if not received_token:
@@ -165,3 +180,4 @@ async def tinkoff_callback(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
+
