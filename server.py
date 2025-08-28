@@ -122,13 +122,27 @@ async def tinkoff_callback_get(request: Request):
     params = dict(request.query_params)
     print("🌐 BackURL GET params:", params)
 
-    # Здесь можно сделать redirect на страницу фронтенда с этими параметрами
+    # Если Success=true — обновляем статус в базе
+    if params.get("Success", "").lower() == "true" and "OrderId" in params:
+        order_id = params["OrderId"]
+        # Находим документ по orderId
+        users_ref = db.collection("telegramUsers").where("orderId", "==", order_id).stream()
+        for doc in users_ref:
+            db.collection("telegramUsers").document(doc.id).update({
+                "subscription.status": "confirmed",
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+                "subscription.lastCallbackPayload": params
+            })
+            print(f"✅ Статус подписки обновлён для {doc.id}")
+
+    # При желании можно сделать redirect на фронтенд
     # return RedirectResponse(url=f"https://astf.vercel.app/success?{request.query_params}")
 
     return {
         "info": "BackURL redirect от Tinkoff",
         "params": params
     }
+
 
 # POST — это серверный callback с JSON и токеном
 @app.post("/tinkoff-callback")
@@ -180,4 +194,5 @@ async def tinkoff_callback_post(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
+
 
