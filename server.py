@@ -3,7 +3,7 @@ import secrets
 import requests
 import hashlib
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -70,7 +70,6 @@ def init_payment(payload: PaymentRequest):
         r.raise_for_status()
         resp_data = r.json()
 
-        # Сохраняем в Firestore
         db.collection("telegramUsers").document(payload.customerKey).set({
             "email": payload.email,
             "orderId": payload.orderId,
@@ -105,7 +104,6 @@ def charge_payment(payload: ChargeRequest):
         r.raise_for_status()
         resp_data = r.json()
 
-        # Логируем списание
         db.collection("telegramUsers").document(payload.customerKey).update({
             "lastCharge": firestore.SERVER_TIMESTAMP,
             "lastChargeResult": resp_data
@@ -115,29 +113,52 @@ def charge_payment(payload: ChargeRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-# 3️⃣ Callback от Tinkoff
+# 3️⃣ Callback от Tinkoff с логированием и GET для тестов
 @app.post("/tinkoff-callback")
-async def tinkoff_callback(payload: dict):
+@app.get("/tinkoff-callback")
+async def tinkoff_callback(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    print(f"🔥 Callback {request.method} получен:", payload)
+
+    if request.method != "POST" or not payload:
+        return {"Success": False, "info": "Callback endpoint, ожидается POST с JSON"}
+
     received_token = payload.get("Token")
     if not received_token:
+        if payload.get("CustomerKey"):
+            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
+                "subscription.lastCallbackError": "No token",
+                "subscription.callbackPayload": payload,
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
+            })
         return {"Success": False, "error": "No token"}
 
-    payload_copy = payload.copy()
+    payload_copy = dict(payload)
     payload_copy.pop("Token", None)
     expected_token = generate_token(payload_copy)
 
     if not secrets.compare_digest(received_token, expected_token):
+        if payload.get("CustomerKey"):
+            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
+                "subscription.lastCallbackError": "Invalid token",
+                "subscription.callbackPayload": payload,
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
+            })
         return {"Success": False, "error": "Invalid token"}
 
     status = payload.get("Status")
     customer_key = payload.get("CustomerKey")
     rebill_id = payload.get("RebillId")
 
-    # Обновляем Firestore
     if customer_key:
         update_data = {
-            "subscription.status": status.lower(),
-            "subscription.updatedAt": firestore.SERVER_TIMESTAMP
+            "subscription.status": (status or "").lower(),
+            "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+            "subscription.lastCallbackPayload": payload
         }
         if rebill_id:
             update_data["tinkoff.RebillId"] = rebill_id
