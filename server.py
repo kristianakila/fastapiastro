@@ -169,11 +169,17 @@ async def tinkoff_callback_get(request: Request):
         # Находим документ по orderId
         users_ref = db.collection("telegramUsers").where("orderId", "==", order_id).stream()
         for doc in users_ref:
-            db.collection("telegramUsers").document(doc.id).update({
-                "subscription.status": "confirmed",
-                "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
-                "subscription.lastCallbackPayload": params
-            })
+from datetime import datetime, timedelta
+
+expire_at = datetime.utcnow() + timedelta(days=30)
+
+db.collection("telegramUsers").document(doc.id).update({
+    "subscription.status": "Premium",
+    "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+    "subscription.expiresAt": expire_at,
+    "subscription.lastCallbackPayload": params
+})
+
             print(f"✅ Статус подписки обновлён для {doc.id}")
 
             # Сообщение пользователю
@@ -238,13 +244,23 @@ async def tinkoff_callback_post(request: Request):
     rebill_id = payload.get("RebillId")
 
     if customer_key:
-        update_data = {
-            "subscription.status": (status or "").lower(),
-            "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
-            "subscription.lastCallbackPayload": payload
-        }
+from datetime import datetime, timedelta
+
+update_data = {
+    "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+    "subscription.lastCallbackPayload": payload
+}
+
+if status and status.lower() == "confirmed":
+    expire_at = datetime.utcnow() + timedelta(days=30)
+    update_data["subscription.status"] = "Premium"
+    update_data["subscription.expiresAt"] = expire_at
+else:
+    update_data["subscription.status"] = (status or "").lower()
+
         if rebill_id:
             update_data["tinkoff.RebillId"] = rebill_id
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
+
