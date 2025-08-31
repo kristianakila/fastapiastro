@@ -4,9 +4,11 @@ import requests
 import hashlib
 import json
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+import threading
+import time
 
 # Firebase
 import firebase_admin
@@ -72,7 +74,47 @@ def send_telegram_message(chat_id: str, text: str):
     except Exception as e:
         print("Ошибка отправки в Telegram:", e)
 
-# 1️⃣ Init payment
+
+# ----------------- Функции проверки подписки -----------------
+def check_and_update_subscription(doc_ref, user_data):
+    """Проверяем срок действия подписки и обновляем status и доступ к Ученикам"""
+    expires_at = user_data.get("subscription", {}).get("expiresAt")
+    update_data = {}
+    if expires_at:
+        if isinstance(expires_at, firestore.firestore.SERVER_TIMESTAMP.__class__):
+            # Игнорируем серверные таймстампы, они будут актуализированы позже
+            return
+        if expires_at.replace(tzinfo=None) < datetime.utcnow():
+            update_data["subscription.status"] = "expired"
+            update_data["hasStudentsAccess"] = False
+        else:
+            # Подписка активна
+            update_data["subscription.status"] = "Premium"
+            update_data["hasStudentsAccess"] = True
+    if update_data:
+        update_data["subscription.checkedAt"] = firestore.SERVER_TIMESTAMP
+        doc_ref.update(update_data)
+
+
+def periodic_subscription_check():
+    """Фоновая проверка всех пользователей каждые 1 час"""
+    while True:
+        try:
+            users_ref = db.collection("telegramUsers").stream()
+            for doc in users_ref:
+                user_data = doc.to_dict()
+                check_and_update_subscription(db.collection("telegramUsers").document(doc.id), user_data)
+        except Exception as e:
+            print("Ошибка проверки подписок:", e)
+        time.sleep(3600)  # 1 час
+
+
+# Запускаем фоновый поток для проверки подписок
+threading.Thread(target=periodic_subscription_check, daemon=True).start()
+# -------------------------------------------------------------
+
+
+# ----------------- Init payment -----------------
 @app.post("/init-payment")
 def init_payment(payload: PaymentRequest):
     data = {
@@ -121,7 +163,8 @@ def init_payment(payload: PaymentRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-# 2️⃣ Charge
+
+# ----------------- Charge -----------------
 @app.post("/charge")
 def charge_payment(payload: ChargeRequest):
     data = {
@@ -145,7 +188,8 @@ def charge_payment(payload: ChargeRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-# 3️⃣ Tinkoff GET callback
+
+# ----------------- Tinkoff GET callback -----------------
 @app.get("/tinkoff-callback")
 async def tinkoff_callback_get(request: Request):
     params = dict(request.query_params)
@@ -164,8 +208,6 @@ async def tinkoff_callback_get(request: Request):
                 "hasStudentsAccess": True
             })
 
-            print(f"✅ Статус подписки обновлён для {doc.id}")
-
             send_telegram_message(
                 chat_id=int(doc.id),
                 text="🎉 Оплата прошла успешно! Ваша подписка активирована."
@@ -180,7 +222,7 @@ async def tinkoff_callback_get(request: Request):
     return {"info": "BackURL redirect от Tinkoff", "params": params}
 
 
-# 4️⃣ Tinkoff POST callback
+# ----------------- Tinkoff POST callback -----------------
 @app.post("/tinkoff-callback")
 async def tinkoff_callback_post(request: Request):
     try:
@@ -225,23 +267,17 @@ async def tinkoff_callback_post(request: Request):
             "subscription.lastCallbackPayload": payload
         }
 
-        # Проверка и установка статуса Premium
         if status and status.lower() == "confirmed":
             expire_at = datetime.utcnow() + timedelta(days=30)
             update_data["subscription.status"] = "Premium"
             update_data["subscription.expiresAt"] = expire_at
             update_data["hasStudentsAccess"] = True
         else:
-            update_data["subscription.status"] = (status or "").lower()
-            # Проверяем дату окончания подписки
             doc_ref = db.collection("telegramUsers").document(customer_key)
             user_doc = doc_ref.get()
             if user_doc.exists:
                 user_data = user_doc.to_dict()
-                expires_at = user_data.get("subscription", {}).get("expiresAt")
-                if expires_at and expires_at.replace(tzinfo=None) < datetime.utcnow():
-                    update_data["subscription.status"] = "expired"
-                    update_data["hasStudentsAccess"] = False
+                check_and_update_subscription(doc_ref, user_data)
 
         if rebill_id:
             update_data["tinkoff.RebillId"] = rebill_id
@@ -249,6 +285,5 @@ async def tinkoff_callback_post(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
-
 
 
