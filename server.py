@@ -4,7 +4,7 @@ import requests
 import hashlib
 import json
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import threading
@@ -37,6 +37,7 @@ app.add_middleware(
 TERMINAL_KEY = os.getenv("TERMINAL_KEY", "1691507148627DEMO")
 SECRET_KEY = os.getenv("SECRET_KEY", "bm5fjkoz0s5vw87j")
 
+# ----------------- Models -----------------
 class PaymentRequest(BaseModel):
     orderId: str
     amount: int
@@ -49,12 +50,13 @@ class ChargeRequest(BaseModel):
     rebillId: str
     customerKey: str
 
+# ----------------- Token generation -----------------
 def generate_token(data: dict) -> str:
     data_with_password = {**data, "Password": SECRET_KEY}
     token_string = ''.join(str(v) for _, v in sorted(data_with_password.items()))
     return hashlib.sha256(token_string.encode("utf-8")).hexdigest()
 
-# Telegram
+# ----------------- Telegram -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "")
 ADMIN_IDS = [admin.strip() for admin in TELEGRAM_ADMIN_IDS.split(",") if admin.strip()]
@@ -74,30 +76,24 @@ def send_telegram_message(chat_id: str, text: str):
     except Exception as e:
         print("Ошибка отправки в Telegram:", e)
 
-
-# ----------------- Функции проверки подписки -----------------
+# ----------------- Проверка подписки -----------------
 def check_and_update_subscription(doc_ref, user_data):
-    """Проверяем срок действия подписки и обновляем status и доступ к Ученикам"""
     expires_at = user_data.get("subscription", {}).get("expiresAt")
     update_data = {}
     if expires_at:
         if isinstance(expires_at, firestore.firestore.SERVER_TIMESTAMP.__class__):
-            # Игнорируем серверные таймстампы, они будут актуализированы позже
             return
         if expires_at.replace(tzinfo=None) < datetime.utcnow():
             update_data["subscription.status"] = "expired"
             update_data["hasStudentsAccess"] = False
         else:
-            # Подписка активна
             update_data["subscription.status"] = "Premium"
             update_data["hasStudentsAccess"] = True
     if update_data:
         update_data["subscription.checkedAt"] = firestore.SERVER_TIMESTAMP
         doc_ref.update(update_data)
 
-
 def periodic_subscription_check():
-    """Фоновая проверка всех пользователей каждые 1 час"""
     while True:
         try:
             users_ref = db.collection("telegramUsers").stream()
@@ -106,13 +102,9 @@ def periodic_subscription_check():
                 check_and_update_subscription(db.collection("telegramUsers").document(doc.id), user_data)
         except Exception as e:
             print("Ошибка проверки подписок:", e)
-        time.sleep(3600)  # 1 час
+        time.sleep(3600)
 
-
-# Запускаем фоновый поток для проверки подписок
 threading.Thread(target=periodic_subscription_check, daemon=True).start()
-# -------------------------------------------------------------
-
 
 # ----------------- Init payment -----------------
 @app.post("/init-payment")
@@ -127,7 +119,6 @@ def init_payment(payload: PaymentRequest):
         "Recurrent": "Y"
     }
     data["Token"] = generate_token(data)
-
     try:
         r = requests.post("https://securepay.tinkoff.ru/v2/Init", json=data, timeout=10)
         r.raise_for_status()
@@ -163,7 +154,6 @@ def init_payment(payload: PaymentRequest):
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
-
 # ----------------- Charge -----------------
 @app.post("/charge")
 def charge_payment(payload: ChargeRequest):
@@ -178,16 +168,44 @@ def charge_payment(payload: ChargeRequest):
         r = requests.post("https://securepay.tinkoff.ru/v2/Charge", json=data, timeout=10)
         r.raise_for_status()
         resp_data = r.json()
-
         db.collection("telegramUsers").document(payload.customerKey).update({
             "lastCharge": firestore.SERVER_TIMESTAMP,
             "lastChargeResult": resp_data
         })
-
         return resp_data
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": str(e)}
 
+# ----------------- Tinkoff GET callback -----------------
+@app.get("/tinkoff-callback")
+async def tinkoff_callback_get(request: Request):
+    params = dict(request.query_params)
+    print("🌐 BackURL GET params:", params)
+
+    if params.get("Success", "").lower() == "true" and "OrderId" in params:
+        order_id = params["OrderId"]
+        users_ref = db.collection("telegramUsers").where("orderId", "==", order_id).stream()
+        for doc in users_ref:
+            expire_at = datetime.utcnow() + timedelta(days=30)
+            db.collection("telegramUsers").document(doc.id).update({
+                "subscription.status": "Premium",
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+                "subscription.expiresAt": expire_at,
+                "hasStudentsAccess": True
+            })
+
+            # Добавление записи в orders
+            order_record = {
+                "userId": doc.id,
+                "orderId": order_id,
+                "amount": params.get("Amount"),
+                "description": params.get("Description", "Подписка"),
+                "status": "success",
+                "createdAt": firestore.SERVER_TIMESTAMP
+            }
+            db.collection("orders").add(order_record)
+
+    return {"info": "BackURL GET обработан", "params": params}
 
 # ----------------- Tinkoff POST callback -----------------
 @app.post("/tinkoff-callback")
@@ -240,7 +258,7 @@ async def tinkoff_callback_post(request: Request):
             update_data["subscription.expiresAt"] = expire_at
             update_data["hasStudentsAccess"] = True
 
-            # ---------------- Добавление записи в orders ----------------
+            # Добавление записи в orders
             order_record = {
                 "userId": customer_key,
                 "orderId": payload.get("OrderId"),
@@ -251,75 +269,7 @@ async def tinkoff_callback_post(request: Request):
                 "rebillId": rebill_id
             }
             db.collection("orders").add(order_record)
-            # ------------------------------------------------------------
 
-        else:
-            # Проверка и обновление подписки на expired, если нужно
-            doc_ref = db.collection("telegramUsers").document(customer_key)
-            user_doc = doc_ref.get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                check_and_update_subscription(doc_ref, user_data)
-
-        if rebill_id:
-            update_data["tinkoff.RebillId"] = rebill_id
-
-        db.collection("telegramUsers").document(customer_key).update(update_data)
-
-    return {"Success": True}
-
-
-
-# ----------------- Tinkoff POST callback -----------------
-@app.post("/tinkoff-callback")
-async def tinkoff_callback_post(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    print("🔥 Callback POST получен:", payload)
-
-    if not payload:
-        return {"Success": False, "error": "Empty payload"}
-
-    received_token = payload.get("Token")
-    if not received_token:
-        if payload.get("CustomerKey"):
-            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
-                "subscription.lastCallbackError": "No token",
-                "subscription.callbackPayload": payload,
-                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
-            })
-        return {"Success": False, "error": "No token"}
-
-    payload_copy = dict(payload)
-    payload_copy.pop("Token", None)
-    expected_token = generate_token(payload_copy)
-
-    if not secrets.compare_digest(received_token, expected_token):
-        if payload.get("CustomerKey"):
-            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
-                "subscription.lastCallbackError": "Invalid token",
-                "subscription.callbackPayload": payload,
-                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
-            })
-        return {"Success": False, "error": "Invalid token"}
-
-    status = payload.get("Status")
-    customer_key = payload.get("CustomerKey")
-    rebill_id = payload.get("RebillId")
-
-    if customer_key:
-        update_data = {
-            "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
-            "subscription.lastCallbackPayload": payload
-        }
-
-        if status and status.lower() == "confirmed":
-            expire_at = datetime.utcnow() + timedelta(days=30)
-            update_data["subscription.status"] = "Premium"
-            update_data["subscription.expiresAt"] = expire_at
-            update_data["hasStudentsAccess"] = True
         else:
             doc_ref = db.collection("telegramUsers").document(customer_key)
             user_doc = doc_ref.get()
@@ -334,4 +284,8 @@ async def tinkoff_callback_post(request: Request):
 
     return {"Success": True}
 
+# ----------------- Root -----------------
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
