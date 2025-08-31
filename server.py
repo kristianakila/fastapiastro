@@ -167,7 +167,7 @@ async def tinkoff_callback_get(request: Request):
             print(f"✅ Статус подписки обновлён для {doc.id}")
 
             send_telegram_message(
-                chat_id=doc.id,
+                chat_id=int(doc.id),
                 text="🎉 Оплата прошла успешно! Ваша подписка активирована."
             )
 
@@ -249,4 +249,6 @@ async def tinkoff_callback_post(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
+
+
 
