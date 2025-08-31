@@ -189,37 +189,85 @@ def charge_payment(payload: ChargeRequest):
         return {"success": False, "error": str(e)}
 
 
-# ----------------- Tinkoff GET callback -----------------
-@app.get("/tinkoff-callback")
-async def tinkoff_callback_get(request: Request):
-    params = dict(request.query_params)
-    print("🌐 BackURL GET params:", params)
+# ----------------- Tinkoff POST callback -----------------
+@app.post("/tinkoff-callback")
+async def tinkoff_callback_post(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    print("🔥 Callback POST получен:", payload)
 
-    if params.get("Success", "").lower() == "true" and "OrderId" in params:
-        order_id = params["OrderId"]
-        users_ref = db.collection("telegramUsers").where("orderId", "==", order_id).stream()
-        for doc in users_ref:
-            expire_at = datetime.utcnow() + timedelta(days=30)
-            db.collection("telegramUsers").document(doc.id).update({
-                "subscription.status": "Premium",
-                "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
-                "subscription.expiresAt": expire_at,
-                "subscription.lastCallbackPayload": params,
-                "hasStudentsAccess": True
+    if not payload:
+        return {"Success": False, "error": "Empty payload"}
+
+    received_token = payload.get("Token")
+    if not received_token:
+        if payload.get("CustomerKey"):
+            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
+                "subscription.lastCallbackError": "No token",
+                "subscription.callbackPayload": payload,
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
             })
+        return {"Success": False, "error": "No token"}
 
-            send_telegram_message(
-                chat_id=int(doc.id),
-                text="🎉 Оплата прошла успешно! Ваша подписка активирована."
-            )
+    payload_copy = dict(payload)
+    payload_copy.pop("Token", None)
+    expected_token = generate_token(payload_copy)
 
-            for admin_id in ADMIN_IDS:
-                send_telegram_message(
-                    chat_id=admin_id,
-                    text=f"💳 Оплата подтверждена!\nПользователь: {doc.id}\nOrderId: {order_id}"
-                )
+    if not secrets.compare_digest(received_token, expected_token):
+        if payload.get("CustomerKey"):
+            db.collection("telegramUsers").document(payload["CustomerKey"]).update({
+                "subscription.lastCallbackError": "Invalid token",
+                "subscription.callbackPayload": payload,
+                "subscription.updatedAt": firestore.SERVER_TIMESTAMP
+            })
+        return {"Success": False, "error": "Invalid token"}
 
-    return {"info": "BackURL redirect от Tinkoff", "params": params}
+    status = payload.get("Status")
+    customer_key = payload.get("CustomerKey")
+    rebill_id = payload.get("RebillId")
+
+    if customer_key:
+        update_data = {
+            "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
+            "subscription.lastCallbackPayload": payload
+        }
+
+        if status and status.lower() == "confirmed":
+            expire_at = datetime.utcnow() + timedelta(days=30)
+            update_data["subscription.status"] = "Premium"
+            update_data["subscription.expiresAt"] = expire_at
+            update_data["hasStudentsAccess"] = True
+
+            # ---------------- Добавление записи в orders ----------------
+            order_record = {
+                "userId": customer_key,
+                "orderId": payload.get("OrderId"),
+                "amount": payload.get("Amount"),
+                "description": payload.get("Description", "Подписка"),
+                "status": "success",
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "rebillId": rebill_id
+            }
+            db.collection("orders").add(order_record)
+            # ------------------------------------------------------------
+
+        else:
+            # Проверка и обновление подписки на expired, если нужно
+            doc_ref = db.collection("telegramUsers").document(customer_key)
+            user_doc = doc_ref.get()
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                check_and_update_subscription(doc_ref, user_data)
+
+        if rebill_id:
+            update_data["tinkoff.RebillId"] = rebill_id
+
+        db.collection("telegramUsers").document(customer_key).update(update_data)
+
+    return {"Success": True}
+
 
 
 # ----------------- Tinkoff POST callback -----------------
