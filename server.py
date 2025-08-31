@@ -106,13 +106,11 @@ def init_payment(payload: PaymentRequest):
             }
         }, merge=True)
 
-        # Сообщение пользователю
         send_telegram_message(
             chat_id=payload.customerKey,
             text=f"✅ Ваш заказ <b>{payload.description}</b> на сумму {payload.amount/100:.2f}₽ создан!"
         )
 
-        # Сообщение всем администраторам
         for admin_id in ADMIN_IDS:
             send_telegram_message(
                 chat_id=admin_id,
@@ -162,7 +160,8 @@ async def tinkoff_callback_get(request: Request):
                 "subscription.status": "Premium",
                 "subscription.updatedAt": firestore.SERVER_TIMESTAMP,
                 "subscription.expiresAt": expire_at,
-                "subscription.lastCallbackPayload": params
+                "subscription.lastCallbackPayload": params,
+                "hasStudentsAccess": True
             })
 
             print(f"✅ Статус подписки обновлён для {doc.id}")
@@ -172,7 +171,6 @@ async def tinkoff_callback_get(request: Request):
                 text="🎉 Оплата прошла успешно! Ваша подписка активирована."
             )
 
-            # Сообщение всем администраторам
             for admin_id in ADMIN_IDS:
                 send_telegram_message(
                     chat_id=admin_id,
@@ -180,6 +178,7 @@ async def tinkoff_callback_get(request: Request):
                 )
 
     return {"info": "BackURL redirect от Tinkoff", "params": params}
+
 
 # 4️⃣ Tinkoff POST callback
 @app.post("/tinkoff-callback")
@@ -226,12 +225,23 @@ async def tinkoff_callback_post(request: Request):
             "subscription.lastCallbackPayload": payload
         }
 
+        # Проверка и установка статуса Premium
         if status and status.lower() == "confirmed":
             expire_at = datetime.utcnow() + timedelta(days=30)
             update_data["subscription.status"] = "Premium"
             update_data["subscription.expiresAt"] = expire_at
+            update_data["hasStudentsAccess"] = True
         else:
             update_data["subscription.status"] = (status or "").lower()
+            # Проверяем дату окончания подписки
+            doc_ref = db.collection("telegramUsers").document(customer_key)
+            user_doc = doc_ref.get()
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                expires_at = user_data.get("subscription", {}).get("expiresAt")
+                if expires_at and expires_at.replace(tzinfo=None) < datetime.utcnow():
+                    update_data["subscription.status"] = "expired"
+                    update_data["hasStudentsAccess"] = False
 
         if rebill_id:
             update_data["tinkoff.RebillId"] = rebill_id
@@ -239,3 +249,4 @@ async def tinkoff_callback_post(request: Request):
         db.collection("telegramUsers").document(customer_key).update(update_data)
 
     return {"Success": True}
+
