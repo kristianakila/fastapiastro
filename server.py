@@ -78,6 +78,14 @@ def send_telegram_message(chat_id: str, text: str):
     except Exception as e:
         print("Ошибка отправки в Telegram:", e)
 
+def notify_admins(text: str):
+    """
+    Отправляет сообщение всем администраторам из списка ADMIN_IDS
+    """
+    for admin_id in ADMIN_IDS:
+        send_telegram_message(chat_id=admin_id, text=text)
+
+
 # ----------------- Subscription check -----------------
 def check_and_update_subscription(doc_ref, user_data):
     expires_at = user_data.get("subscription", {}).get("expiresAt")
@@ -178,6 +186,7 @@ async def tinkoff_callback(request: Request):
     update_data = {"tinkoff.lastCallbackPayload": payload, "tinkoff.updatedAt": firestore.SERVER_TIMESTAMP}
 
     if status and status.lower() == "confirmed":
+        # ----------------- Пользователь -----------------
         if product_type == "subscription":
             expire_at = datetime.utcnow() + timedelta(days=30)
             update_data.update({
@@ -197,7 +206,17 @@ async def tinkoff_callback(request: Request):
                 text="✅ Оплата успешна, баланс пополнен на 1 прогноз."
             )
 
-        # Добавляем запись о заказе
+        # ----------------- Администраторы -----------------
+        admin_message = (
+            f"💰 Новый платеж:\n"
+            f"User: {customer_key}\n"
+            f"Product: {product_type}\n"
+            f"Amount: {payload.get('Amount', 0)}\n"
+            f"Status: {status}"
+        )
+        notify_admins(admin_message)
+
+        # ----------------- Запись в orders -----------------
         db.collection("orders").add({
             "customerKey": customer_key,
             "orderId": payload.get("OrderId", ""),
@@ -210,6 +229,7 @@ async def tinkoff_callback(request: Request):
 
     user_ref.update(update_data)
     return {"Success": True}
+
 
 
 # ----------------- Tinkoff GET callback -----------------
@@ -236,6 +256,7 @@ async def tinkoff_callback_get(request: Request):
         }
 
         if params.get("Success", "").lower() == "true":
+            # ----------------- Пользователь -----------------
             if product_type == "subscription":
                 expire_at = datetime.utcnow() + timedelta(days=30)
                 update_data.update({
@@ -255,7 +276,17 @@ async def tinkoff_callback_get(request: Request):
                     text="✅ Оплата успешна, баланс пополнен на 1 прогноз."
                 )
 
-            # Добавляем запись о заказе
+            # ----------------- Администраторы -----------------
+            admin_message = (
+                f"💰 Новый платеж (GET callback):\n"
+                f"User: {doc.id}\n"
+                f"Product: {product_type}\n"
+                f"Amount: {params.get('Amount', 0)}\n"
+                f"Status: confirmed"
+            )
+            notify_admins(admin_message)
+
+            # ----------------- Запись в orders -----------------
             db.collection("orders").add({
                 "customerKey": doc.id,
                 "orderId": params.get("OrderId", ""),
@@ -273,6 +304,7 @@ async def tinkoff_callback_get(request: Request):
         return {"Success": False, "error": "User with this OrderId not found"}
 
     return {"Success": True}
+
 
 
 # ----------------- Root -----------------
