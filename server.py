@@ -184,12 +184,33 @@ async def tinkoff_callback(request: Request):
                 "subscription.status": "Premium",
                 "subscription.expiresAt": expire_at
             })
+            send_telegram_message(
+                chat_id=customer_key,
+                text=f"🎉 Ваша подписка активирована до {expire_at.strftime('%d.%m.%Y %H:%M')}."
+            )
         else:  # one-time
             update_data.update({
                 "balance": user_data.get("balance", 0) + 1
             })
+            send_telegram_message(
+                chat_id=customer_key,
+                text="✅ Оплата успешна, баланс пополнен на 1 прогноз."
+            )
+
+        # Добавляем запись о заказе
+        db.collection("orders").add({
+            "customerKey": customer_key,
+            "orderId": payload.get("OrderId", ""),
+            "amount": payload.get("Amount", 0),
+            "status": status,
+            "productType": product_type,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "tinkoffPayload": payload
+        })
+
     user_ref.update(update_data)
     return {"Success": True}
+
 
 # ----------------- Tinkoff GET callback -----------------
 @app.get("/tinkoff-callback")
@@ -221,10 +242,29 @@ async def tinkoff_callback_get(request: Request):
                     "subscription.status": "Premium",
                     "subscription.expiresAt": expire_at
                 })
+                send_telegram_message(
+                    chat_id=doc.id,
+                    text=f"🎉 Ваша подписка активирована до {expire_at.strftime('%d.%m.%Y %H:%M')}."
+                )
             else:  # one-time
                 update_data.update({
                     "balance": user_data.get("balance", 0) + 1
                 })
+                send_telegram_message(
+                    chat_id=doc.id,
+                    text="✅ Оплата успешна, баланс пополнен на 1 прогноз."
+                )
+
+            # Добавляем запись о заказе
+            db.collection("orders").add({
+                "customerKey": doc.id,
+                "orderId": params.get("OrderId", ""),
+                "amount": int(params.get("Amount", 0)),
+                "status": "confirmed",
+                "productType": product_type,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "tinkoffPayload": params
+            })
 
         user_ref.update(update_data)
         updated = True
@@ -239,3 +279,5 @@ async def tinkoff_callback_get(request: Request):
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
