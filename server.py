@@ -198,41 +198,44 @@ async def tinkoff_callback_get(request: Request):
     print("🌐 Callback GET получен:", params)
 
     order_id = params.get("OrderId")
-    description = params.get("Description", "")
-    customer_key = params.get("CustomerKey")
+    if not order_id:
+        return {"Success": False, "error": "Missing OrderId"}
 
-    if not order_id or not customer_key:
-        return {"Success": False, "error": "Missing OrderId or CustomerKey"}
+    # Ищем пользователя по orderId
+    users_ref = db.collection("telegramUsers").where("orderId", "==", order_id).stream()
+    updated = False
+    for doc in users_ref:
+        user_ref = db.collection("telegramUsers").document(doc.id)
+        user_data = doc.to_dict()
+        product_type = user_data.get("productType", "subscription")
 
-    user_ref = db.collection("telegramUsers").document(customer_key)
-    user_doc = user_ref.get()
-    if not user_doc.exists:
-        return {"Success": False, "error": "User not found"}
+        update_data = {
+            "tinkoff.lastCallbackParams": params,
+            "tinkoff.updatedAt": firestore.SERVER_TIMESTAMP
+        }
 
-    user_data = user_doc.to_dict()
-    product_type = user_data.get("productType", "subscription")
+        if params.get("Success", "").lower() == "true":
+            if product_type == "subscription":
+                expire_at = datetime.utcnow() + timedelta(days=30)
+                update_data.update({
+                    "subscription.status": "Premium",
+                    "subscription.expiresAt": expire_at
+                })
+            else:  # one-time
+                update_data.update({
+                    "balance": user_data.get("balance", 0) + 1
+                })
 
-    update_data = {
-        "tinkoff.lastCallbackParams": params,
-        "tinkoff.updatedAt": firestore.SERVER_TIMESTAMP
-    }
+        user_ref.update(update_data)
+        updated = True
 
-    if params.get("Success", "").lower() == "true":
-        if product_type == "subscription":
-            expire_at = datetime.utcnow() + timedelta(days=30)
-            update_data.update({
-                "subscription.status": "Premium",
-                "subscription.expiresAt": expire_at
-            })
-        else:  # one-time
-            update_data.update({
-                "balance": user_data.get("balance", 0) + 1
-            })
-    user_ref.update(update_data)
+    if not updated:
+        return {"Success": False, "error": "User with this OrderId not found"}
+
     return {"Success": True}
+
 
 # ----------------- Root -----------------
 @app.get("/")
 def root():
     return {"status": "ok"}
-
