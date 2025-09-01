@@ -142,7 +142,7 @@ async def init_payment(payment_request: PaymentRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ----------------- Tinkoff callback -----------------
+# ----------------- Tinkoff POST callback -----------------
 @app.post("/tinkoff-callback")
 async def tinkoff_callback(request: Request):
     try:
@@ -167,11 +167,11 @@ async def tinkoff_callback(request: Request):
         return {"Success": False, "error": "Invalid token"}
 
     status = payload.get("Status")
-    # Получаем продукт для правильного обновления
     user_ref = db.collection("telegramUsers").document(customer_key)
     user_doc = user_ref.get()
     if not user_doc.exists:
         return {"Success": False, "error": "User not found"}
+
     user_data = user_doc.to_dict()
     product_type = user_data.get("productType", "subscription")
 
@@ -185,15 +185,50 @@ async def tinkoff_callback(request: Request):
                 "subscription.expiresAt": expire_at
             })
         else:  # one-time
-            # Можно добавлять баланс или флаг использования
             update_data.update({
                 "balance": user_data.get("balance", 0) + 1
             })
-        user_ref.update(update_data)
-    else:
-        # при failed или pending можно ничего не менять
-        user_ref.update(update_data)
+    user_ref.update(update_data)
+    return {"Success": True}
 
+# ----------------- Tinkoff GET callback -----------------
+@app.get("/tinkoff-callback")
+async def tinkoff_callback_get(request: Request):
+    params = dict(request.query_params)
+    print("🌐 Callback GET получен:", params)
+
+    order_id = params.get("OrderId")
+    description = params.get("Description", "")
+    customer_key = params.get("CustomerKey")
+
+    if not order_id or not customer_key:
+        return {"Success": False, "error": "Missing OrderId or CustomerKey"}
+
+    user_ref = db.collection("telegramUsers").document(customer_key)
+    user_doc = user_ref.get()
+    if not user_doc.exists:
+        return {"Success": False, "error": "User not found"}
+
+    user_data = user_doc.to_dict()
+    product_type = user_data.get("productType", "subscription")
+
+    update_data = {
+        "tinkoff.lastCallbackParams": params,
+        "tinkoff.updatedAt": firestore.SERVER_TIMESTAMP
+    }
+
+    if params.get("Success", "").lower() == "true":
+        if product_type == "subscription":
+            expire_at = datetime.utcnow() + timedelta(days=30)
+            update_data.update({
+                "subscription.status": "Premium",
+                "subscription.expiresAt": expire_at
+            })
+        else:  # one-time
+            update_data.update({
+                "balance": user_data.get("balance", 0) + 1
+            })
+    user_ref.update(update_data)
     return {"Success": True}
 
 # ----------------- Root -----------------
